@@ -41,11 +41,15 @@ scorch -t [domain/]user[:pass]@host [flags]
   -svc      nome do serviço (aleatório se omitido)
   -timeout  timeout por comando (padrão: 30s)
   -port     porta SMB (padrão: 445)
+  -proxy    SOCKS5 proxy — socks5://host:port
   -debug    output verboso
 ```
 
+> **proxychains e binários estáticos:** Go compila estático por padrão e bypassa o LD_PRELOAD do proxychains. Use `-proxy socks5://127.0.0.1:1080` em vez de `proxychains ./scorch`.
+
 **Diferenças vs smbexec.py**
-- `--timeout` por comando (original não tem)
+- `-timeout` por comando (original não tem)
+- `-proxy` nativo via `golang.org/x/net/proxy` (proxychains não funciona com binários estáticos Go)
 - Detecção explícita de output vazio (avisa em vez de silenciar)
 - Backoff exponencial na reconexão ao SCM
 
@@ -67,6 +71,7 @@ haunt -t [domain/]user[:pass]@host -file remcom.exe [flags]
   -path     working directory no target
   -svc      nome do serviço
   -port     porta SMB (padrão: 445)
+  -proxy    SOCKS5 proxy — socks5://host:port
   -debug    output verboso
 ```
 
@@ -94,17 +99,28 @@ whisper -t [domain/]user[:pass]@host [flags]
   -shell        cmd ou powershell (padrão: cmd)
   -nooutput     não recupera output (imprime o PID retornado)
   -silent       executa sem wrapper cmd.exe (sem output)
-  -fallback-scm usa SCM em vez de DCOM nativo (padrão: true)
+  -fallback-scm usa SCM via SMB/445 (padrão: true); false = DCOM nativo via porta 135 (sem SMB)
   -timeout      timeout de espera pelo output (padrão: 30s)
-  -port         porta SMB (padrão: 445)
+  -port         porta SMB (padrão: 445; ignorada quando -fallback-scm=false)
+  -proxy        SOCKS5 proxy — socks5://host:port
   -debug        output verboso
 ```
 
-**Sobre `--fallback-scm`**
-O caminho nativo DCOM implementa resolução via endpoint mapper (porta 135), handshake NTLM dentro do DCE-RPC e `NTLMLogin` até extração do IPID da interface WMI. A camada final de marshaling ORPC/VARIANT para `Win32_Process.Create` retorna erro descritivo com o IPID capturado. O fallback SCM (padrão) cobre o caso de uso operacional.
+**`-fallback-scm=false` — DCOM via porta 135**
+
+Quando SMB/445 está bloqueado (firewall ou segmentação), use `-fallback-scm=false`: whisper resolve o endpoint WMI via EPM (porta 135), faz o handshake NTLM dentro do DCE-RPC e estabelece a sessão diretamente sem abrir nenhuma porta SMB. Útil com pivoting:
+
+```bash
+# SMB/445 bloqueado, só 135 acessível — via SOCKS5
+./whisper -t domain/user:pass@192.168.1.10 -fallback-scm=false -proxy socks5://127.0.0.1:1080
+```
+
+> **proxychains e binários estáticos:** Use `-proxy socks5://...` em vez de `proxychains ./whisper` — Go é estático e o LD_PRELOAD do proxychains não tem efeito.
 
 **Diferenças vs wmiexec.py**
+- `-fallback-scm=false` conecta via DCOM/135 sem precisar de SMB (wmiexec.py sempre requer 445)
 - `-nooutput` imprime o PID retornado pelo `Create()` em vez de suprimir silenciosamente
+- `-proxy` nativo via `golang.org/x/net/proxy`
 - `-timeout` configurável para espera do output file
 
 ---
