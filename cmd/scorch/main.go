@@ -31,8 +31,9 @@ func main() {
 	port := flag.Int("port", 445, "SMB port")
 	svcName := flag.String("svc", "", "service name (random if empty)")
 	dcIP := flag.String("dc", "", "domain controller IP")
-	timeout := flag.Duration("timeout", 30*time.Second, "per-command timeout")
-	debug := flag.Bool("debug", false, "verbose output")
+	timeout    := flag.Duration("timeout", 30*time.Second, "per-command timeout")
+	debug      := flag.Bool("debug", false, "verbose output")
+	proxyAddr  := flag.String("proxy", "", "SOCKS5 proxy socks5://host:port")
 	flag.Parse()
 
 	_ = dcIP
@@ -57,6 +58,7 @@ func main() {
 		Username: user,
 		Password: pass,
 		Domain:   domain,
+		ProxyURL: *proxyAddr,
 	}
 
 	if *hashes != "" {

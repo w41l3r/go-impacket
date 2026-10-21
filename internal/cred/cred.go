@@ -15,6 +15,7 @@ type Bundle struct {
 	AESKey      string
 	UseKerberos bool
 	KDCHost     string
+	ProxyURL    string // socks5://host:port or socks5h://host:port
 }
 
 func (b *Bundle) IsPassTheHash() bool {

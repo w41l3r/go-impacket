@@ -54,8 +54,9 @@ func main() {
 	execCmd := flag.String("cmd", "", "command to run (interactive shell if empty)")
 	workDir := flag.String("path", "C:\\", "working directory for the command")
 	port := flag.Int("port", 445, "SMB port")
-	svcName := flag.String("svc", "", "service name (random if empty)")
-	debug := flag.Bool("debug", false, "verbose")
+	svcName   := flag.String("svc", "", "service name (random if empty)")
+	debug     := flag.Bool("debug", false, "verbose")
+	proxyAddr := flag.String("proxy", "", "SOCKS5 proxy socks5://host:port")
 	flag.Parse()
 
 	_ = debug
@@ -76,7 +77,7 @@ func main() {
 		fatal("parse target: %v", err)
 	}
 
-	bundle := &cred.Bundle{Username: user, Password: pass, Domain: domain}
+	bundle := &cred.Bundle{Username: user, Password: pass, Domain: domain, ProxyURL: *proxyAddr}
 	if *hashes != "" {
 		_, nt, err := cred.FromHashes(*hashes)
 		if err != nil {

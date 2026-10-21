@@ -17,6 +17,7 @@ import (
 	"github.com/go-impacket/kit/pkg/randname"
 	"github.com/jfjallid/go-smb/ntlmssp"
 	"github.com/jfjallid/go-smb/smb"
+	"golang.org/x/net/proxy"
 )
 
 type Executor struct {
@@ -27,6 +28,7 @@ type Executor struct {
 	FallbackSCM bool
 	host        string
 	bundle      *cred.Bundle
+	proxyDialer proxy.Dialer
 }
 
 func Connect(host string, port int, bundle *cred.Bundle, share string, noOutput bool) (*Executor, error) {
@@ -34,6 +36,7 @@ func Connect(host string, port int, bundle *cred.Bundle, share string, noOutput 
 	if err != nil {
 		return nil, err
 	}
+	pd, _ := transport.ProxyDialer(bundle.ProxyURL)
 	return &Executor{
 		ep:          ep,
 		conn:        ep.Raw(),
@@ -42,6 +45,22 @@ func Connect(host string, port int, bundle *cred.Bundle, share string, noOutput 
 		FallbackSCM: true,
 		host:        host,
 		bundle:      bundle,
+		proxyDialer: pd,
+	}, nil
+}
+
+// ConnectDCOM creates an Executor that skips the SMB leg and goes straight to
+// DCOM/WMI on port 135. Use when SMB (port 445) is blocked but RPC is reachable.
+func ConnectDCOM(host string, bundle *cred.Bundle) (*Executor, error) {
+	pd, err := transport.ProxyDialer(bundle.ProxyURL)
+	if err != nil {
+		return nil, err
+	}
+	return &Executor{
+		FallbackSCM: false,
+		host:        host,
+		bundle:      bundle,
+		proxyDialer: pd,
 	}, nil
 }
 
@@ -159,8 +178,15 @@ type rpcSession struct {
 	callID uint32
 }
 
-func openRPC(host string, port int, timeout time.Duration) (*rpcSession, error) {
-	c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), timeout)
+func openRPC(host string, port int, timeout time.Duration, d proxy.Dialer) (*rpcSession, error) {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	var c net.Conn
+	var err error
+	if d != nil {
+		c, err = d.Dial("tcp", addr)
+	} else {
+		c, err = net.DialTimeout("tcp", addr, timeout)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -364,8 +390,8 @@ func bindNTLM(s *rpcSession, ctxID uint16, ifUUID [16]byte, ifMaj, ifMin uint16,
 
 // resolveWMIPort queries the Endpoint Mapper (port 135) for the dynamic TCP port
 // hosting IWbemLevel1Login. Falls back to scanning 49152..49165 on EPM failure.
-func resolveWMIPort(host string) (int, error) {
-	s, err := openRPC(host, 135, 10*time.Second)
+func resolveWMIPort(host string, d proxy.Dialer) (int, error) {
+	s, err := openRPC(host, 135, 10*time.Second, d)
 	if err != nil {
 		return 0, fmt.Errorf("EPM connect: %w", err)
 	}
@@ -400,7 +426,7 @@ func resolveWMIPort(host string) (int, error) {
 
 	// Fallback: probe common DCOM dynamic range
 	for p := 49152; p <= 49165; p++ {
-		probe, err := openRPC(host, p, 2*time.Second)
+		probe, err := openRPC(host, p, 2*time.Second, d)
 		if err != nil {
 			continue
 		}
@@ -595,13 +621,13 @@ func extractIPID(stub []byte) ([16]byte, error) {
 // Steps: EPM port lookup → DCE-RPC bind with NTLM → NTLMLogin → Win32_Process.Create
 func (x *Executor) invokeViaDCOM(cmd string, timeout time.Duration) (string, int, error) {
 	// Step 1: EPM port resolution
-	wmiPort, err := resolveWMIPort(x.host)
+	wmiPort, err := resolveWMIPort(x.host, x.proxyDialer)
 	if err != nil {
 		return "", 1, fmt.Errorf("[step 1/4 EPM] %w", err)
 	}
 
 	// Step 2: DCE-RPC connect + NTLM bind to IWbemLevel1Login
-	s, err := openRPC(x.host, wmiPort, 10*time.Second)
+	s, err := openRPC(x.host, wmiPort, 10*time.Second, x.proxyDialer)
 	if err != nil {
 		return "", 1, fmt.Errorf("[step 2/4 DCOM-connect port=%d] %w", wmiPort, err)
 	}
