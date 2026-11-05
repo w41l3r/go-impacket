@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -147,6 +148,7 @@ const (
 	dceFlagLast        = 0x02
 	dceAuthNTLM        = uint8(0x0a)
 	dceAuthConnect     = uint8(0x02)
+	dceAuthPktIntegrity = uint8(0x05)
 	dceMaxFrag         = uint16(4280)
 )
 
@@ -156,7 +158,15 @@ var (
 	uuidNDR          = msUUID("8A885D04-1CEB-11C9-9FE8-08002B104860")
 	uuidWbemLogin    = msUUID("F309AD18-D86A-11D0-A075-00C04FB68820")
 	uuidWbemServices = msUUID("9556DC99-828C-11CF-A37E-00AA003240C7")
+	uuidIActivation  = msUUID("4D9F4AB8-7D1C-11CF-861E-0020AF6E7C57")
 )
+
+// CLSID_WbemLevel1Login {8BC3F05E-D86B-11D0-A075-00C04FB68820} in LE wire format.
+// Used in IActivation.RemoteActivation to activate the WMI service.
+var clsidWbemLevel1Login = [16]byte{
+	0x5E, 0xF0, 0xC3, 0x8B, 0x6B, 0xD8, 0xD0, 0x11,
+	0xA0, 0x75, 0x00, 0xC0, 0x4F, 0xB6, 0x88, 0x20,
+}
 
 // msUUID converts a UUID string to the 16-byte MS-RPCE wire encoding.
 // The first three hyphen-delimited fields are stored little-endian; the rest big-endian.
@@ -274,15 +284,27 @@ func encodeSyntax(u [16]byte, major, minor uint16) []byte {
 }
 
 func buildAuthTrailer(authType, authLevel byte, val []byte) []byte {
+	return buildAuthTrailerPad(authType, authLevel, 0, val)
+}
+
+// buildAuthTrailerPad builds the 8-byte auth verifier header followed by val.
+// padLen is auth_pad_length: how many padding bytes precede this trailer.
+func buildAuthTrailerPad(authType, authLevel, padLen byte, val []byte) []byte {
 	b := make([]byte, 8+len(val))
 	b[0] = authType
 	b[1] = authLevel
+	b[2] = padLen // auth_pad_length
+	// b[3] = auth_reserved = 0
+	// b[4:8] = auth_context_id = 0
 	copy(b[8:], val)
 	return b
 }
 
 // buildBind creates a DCE-RPC BIND packet (with optional NTLM verifier).
-func buildBind(callID uint32, ctxID uint16, ifUUID [16]byte, ifMaj, ifMin uint16, ntlmNeg []byte) []byte {
+//
+// When NTLM is present the body must be padded to a 4-byte boundary before the
+// auth trailer; auth_pad_length in the trailer reports how many bytes were added.
+func buildBind(callID uint32, ctxID uint16, ifUUID [16]byte, ifMaj, ifMin uint16, ntlmNeg []byte, authLevel byte) []byte {
 	body := new(bytes.Buffer)
 	binary.Write(body, binary.LittleEndian, dceMaxFrag)   // max_xmit_frag
 	binary.Write(body, binary.LittleEndian, dceMaxFrag)   // max_recv_frag
@@ -298,8 +320,12 @@ func buildBind(callID uint32, ctxID uint16, ifUUID [16]byte, ifMaj, ifMin uint16
 	var trailer []byte
 	var authL uint16
 	if len(ntlmNeg) > 0 {
-		trailer = buildAuthTrailer(dceAuthNTLM, dceAuthConnect, ntlmNeg)
-		authL = uint16(len(trailer))
+		// Pad body to 4-byte alignment; auth_pad_length reports padding added.
+		padLen := (4 - (body.Len() % 4)) % 4
+		body.Write(make([]byte, padLen))
+		trailer = buildAuthTrailerPad(dceAuthNTLM, authLevel, byte(padLen), ntlmNeg)
+		// auth_length = length of auth_value ONLY (not the 8-byte verifier header).
+		authL = uint16(len(ntlmNeg))
 	}
 
 	fragLen := uint16(16 + body.Len() + len(trailer))
@@ -315,9 +341,10 @@ func buildBind(callID uint32, ctxID uint16, ifUUID [16]byte, ifMaj, ifMin uint16
 }
 
 // buildAuth3 creates the AUTH3 packet (NTLM authenticate response to BIND_ACK challenge).
-func buildAuth3(callID uint32, ntlmAuth []byte) []byte {
-	trailer := buildAuthTrailer(dceAuthNTLM, dceAuthConnect, ntlmAuth)
-	authL := uint16(len(trailer))
+func buildAuth3(callID uint32, ntlmAuth []byte, authLevel byte) []byte {
+	trailer := buildAuthTrailer(dceAuthNTLM, authLevel, ntlmAuth)
+	// auth_length = length of auth_value ONLY (not the 8-byte verifier header).
+	authL := uint16(len(ntlmAuth))
 	fragLen := uint16(16 + 4 + len(trailer)) // hdr + 4 pad
 	hdr := buildHdr(dceTypAuth3, dceFlagFirst|dceFlagLast, fragLen, authL, callID)
 	out := new(bytes.Buffer)
@@ -342,7 +369,9 @@ func buildRequest(callID uint32, ctxID, opnum uint16, stub []byte) []byte {
 
 // bindNTLM performs the 3-message NTLM handshake inside DCE-RPC:
 // BIND (type1) → BIND_ACK (type2 challenge) → AUTH3 (type3 authenticate).
-func bindNTLM(s *rpcSession, ctxID uint16, ifUUID [16]byte, ifMaj, ifMin uint16, b *cred.Bundle) error {
+// Returns the ntlmssp.Client so the caller can use it for packet signing when
+// authLevel=dceAuthPktIntegrity (5) is used.
+func bindNTLM(s *rpcSession, ctxID uint16, ifUUID [16]byte, ifMaj, ifMin uint16, b *cred.Bundle, authLevel byte) (*ntlmssp.Client, error) {
 	nc := &ntlmssp.Client{
 		User:     b.Username,
 		Domain:   b.Domain,
@@ -354,92 +383,270 @@ func bindNTLM(s *rpcSession, ctxID uint16, ifUUID [16]byte, ifMaj, ifMin uint16,
 
 	neg, err := nc.Negotiate()
 	if err != nil {
-		return fmt.Errorf("NTLM Negotiate: %w", err)
+		return nil, fmt.Errorf("NTLM Negotiate: %w", err)
 	}
 
 	callID := s.nextID()
-	pkt := buildBind(callID, ctxID, ifUUID, ifMaj, ifMin, neg)
+	pkt := buildBind(callID, ctxID, ifUUID, ifMaj, ifMin, neg, authLevel)
 	resp, err := s.sendRecv(pkt)
 	if err != nil {
-		return fmt.Errorf("BIND send/recv: %w", err)
+		return nil, fmt.Errorf("BIND send/recv: %w", err)
 	}
 	switch pktType(resp) {
 	case dceTypBindNak:
-		return fmt.Errorf("BIND_NAK — interface not supported on this port")
+		return nil, fmt.Errorf("BIND_NAK — interface not supported on this port")
 	case dceTypBindAck:
 		// ok
 	default:
-		return fmt.Errorf("unexpected DCE-RPC response to BIND: 0x%02x", pktType(resp))
+		return nil, fmt.Errorf("unexpected DCE-RPC response to BIND: 0x%02x", pktType(resp))
 	}
 
 	challenge := authValue(resp)
 	if len(challenge) == 0 {
 		// Server accepted without challenge (null session)
-		return nil
+		return nc, nil
 	}
 
 	auth, err := nc.Authenticate(challenge)
 	if err != nil {
-		return fmt.Errorf("NTLM Authenticate: %w", err)
+		return nil, fmt.Errorf("NTLM Authenticate: %w", err)
 	}
 
-	auth3 := buildAuth3(callID, auth)
+	auth3 := buildAuth3(callID, auth, authLevel)
 	// AUTH3 has no server response
-	return s.send(auth3)
+	return nc, s.send(auth3)
 }
 
-// resolveWMIPort queries the Endpoint Mapper (port 135) for the dynamic TCP port
-// hosting IWbemLevel1Login. Falls back to scanning 49152..49165 on EPM failure.
-func resolveWMIPort(host string, d proxy.Dialer) (int, error) {
+// buildSignedRequest creates a DCE-RPC REQUEST packet with an NTLM signature
+// verifier appended (required for auth_level=5 PKT_INTEGRITY connections).
+//
+// Per MS-RPCE §3.3.4.1.1, the signed data covers: PDU header + stub + padding
+// + auth verifier header (8 bytes, auth_value zeroed). The 16-byte NTLM MAC
+// is then placed in the auth_value field.
+func buildSignedRequest(nc *ntlmssp.Client, callID uint32, ctxID, opnum uint16, stub []byte, seqNum uint32) ([]byte, uint32, error) {
+	session := nc.Session()
+	if session == nil {
+		return nil, 0, fmt.Errorf("NTLM session not established (Authenticate not called)")
+	}
+
+	// Build request body (without signing)
+	reqBody := new(bytes.Buffer)
+	binary.Write(reqBody, binary.LittleEndian, uint32(len(stub))) // alloc_hint
+	binary.Write(reqBody, binary.LittleEndian, ctxID)
+	binary.Write(reqBody, binary.LittleEndian, opnum)
+	reqBody.Write(stub)
+
+	// Pad to 4-byte boundary before auth trailer
+	padLen := byte((4 - (reqBody.Len() % 4)) % 4)
+	reqBody.Write(make([]byte, padLen))
+
+	// Auth verifier header (8 bytes) with zeroed 16-byte auth_value placeholder
+	authHdr := buildAuthTrailerPad(dceAuthNTLM, dceAuthPktIntegrity, padLen, make([]byte, 16))
+
+	// fragLen covers header(16) + body(with padding) + auth verifier(8 hdr + 16 sig).
+	// auth_length = length of auth_value ONLY (not the 8-byte verifier header).
+	fragLen := uint16(16 + reqBody.Len() + len(authHdr))
+	authL := uint16(16) // length of NTLM signature (auth_value only)
+
+	hdr := buildHdr(dceTypRequest, dceFlagFirst|dceFlagLast, fragLen, authL, callID)
+
+	// Signed content = hdr + body(with padding) + auth verifier header (NOT auth_value)
+	toSign := make([]byte, 0, 16+reqBody.Len()+8)
+	toSign = append(toSign, hdr...)
+	toSign = append(toSign, reqBody.Bytes()...)
+	toSign = append(toSign, authHdr[:8]...) // only the 8-byte header, not the sig placeholder
+
+	sig, newSeqNum := session.Sum(toSign, seqNum)
+
+	// Final auth trailer with real signature
+	realAuth := buildAuthTrailerPad(dceAuthNTLM, dceAuthPktIntegrity, padLen, sig)
+
+	out := new(bytes.Buffer)
+	out.Write(hdr)
+	out.Write(reqBody.Bytes())
+	out.Write(realAuth)
+
+	return out.Bytes(), newSeqNum, nil
+}
+
+// resolveWMIPort uses IActivation.RemoteActivation on port 135 to discover the
+// dynamic TCP port hosting IWbemLevel1Login.
+//
+// IWbemLevel1Login is NOT registered in the EPM — ept_map returns
+// ept_s_not_registered. The correct approach is DCOM activation via
+// IActivation (UUID: 4D9F4AB8-7D1C-11CF-861E-0020AF6E7C57, opnum=0).
+func resolveWMIPort(host string, bundle *cred.Bundle, d proxy.Dialer) (int, error) {
 	s, err := openRPC(host, 135, 10*time.Second, d)
 	if err != nil {
-		return 0, fmt.Errorf("EPM connect: %w", err)
+		return 0, fmt.Errorf("connect port 135: %w", err)
 	}
 	defer s.Close()
 
-	// Bind to EPM (no auth required)
-	callID := s.nextID()
-	bindPkt := buildBind(callID, 0, uuidEPM, 3, 0, nil)
-	resp, err := s.sendRecv(bindPkt)
+	// IActivation on port 135 requires PKT_INTEGRITY (auth_level=5) — level 2
+	// returns BIND_NAK and level 2 returns rpc_s_access_denied on RemoteActivation.
+	nc, err := bindNTLM(s, 0, uuidIActivation, 0, 0, bundle, dceAuthPktIntegrity)
 	if err != nil {
-		return 0, fmt.Errorf("EPM BIND: %w", err)
-	}
-	if pktType(resp) != dceTypBindAck {
-		return 0, fmt.Errorf("EPM BIND_ACK expected, got 0x%02x", pktType(resp))
+		return 0, fmt.Errorf("BIND IActivation: %w", err)
 	}
 
-	// ept_map request
-	stub := buildEptMapStub()
-	reqPkt := buildRequest(s.nextID(), 0, 3, stub)
-	resp, err = s.sendRecv(reqPkt)
+	// RemoteActivation (opnum 0) — must be signed at auth_level=5
+	stub := buildRemoteActivationStub()
+	reqPkt, _, err := buildSignedRequest(nc, s.nextID(), 0, 0, stub, 0)
 	if err != nil {
-		return 0, fmt.Errorf("EPM ept_map: %w", err)
+		return 0, fmt.Errorf("build signed RemoteActivation: %w", err)
+	}
+	resp, err := s.sendRecv(reqPkt)
+	if err != nil {
+		return 0, fmt.Errorf("RemoteActivation RPC: %w", err)
 	}
 	if pktType(resp) != dceTypResponse {
-		return 0, fmt.Errorf("EPM response type 0x%02x", pktType(resp))
+		return 0, fmt.Errorf("RemoteActivation unexpected type 0x%02x", pktType(resp))
 	}
 
-	port := scanForTCPPort(resp[24:]) // skip DCE hdr(16) + request hdr(8)
-	if port > 0 {
-		return port, nil
+	// Parse stub (skip DCE hdr(16) + response hdr(8) = 24 bytes)
+	port, err := parseActivationPort(resp[24:])
+	if err != nil {
+		return 0, fmt.Errorf("parse RemoteActivation response: %w", err)
+	}
+	return port, nil
+}
+
+// buildRemoteActivationStub encodes the NDR parameters for
+// IActivation::RemoteActivation(opnum=0):
+//
+//	ORPCthis, CLSID, pwszObjectName=NULL, pObjectStorage=NULL,
+//	ClientImpLevel=2, Mode=0, Interfaces=1, pIIDs=[IWbemLevel1Login],
+//	cRequestedProtseqs=1, aRequestedProtseqs=[7(ncacn_ip_tcp)]
+//
+// Stub layout captured from impacket (102 bytes total):
+// [0:32]  ORPCthis   [32:48] CLSID   [48:52] NULL   [52:56] NULL
+// [56:60] ImpLevel=2 [60:64] Mode=0  [64:68] nIf=1
+// [68:72] pIIDs-ref  [72:76] max=1   [76:92] IID
+// [92:94] nProto=1   [94:96] pad     [96:100] max=1  [100:102] 7
+func buildRemoteActivationStub() []byte {
+	b := new(bytes.Buffer)
+
+	// ORPCthis: version 5.7, flags=1 (ORPCF_LOCAL), CID, extensions=NULL
+	orpc := buildORPCTHIS()
+	orpc[4] = 1 // flags = 1
+	b.Write(orpc)
+
+	// CLSID_WbemLevel1Login
+	b.Write(clsidWbemLevel1Login[:])
+
+	// pwszObjectName: NULL unique pointer
+	binary.Write(b, binary.LittleEndian, uint32(0))
+
+	// pObjectStorage: NULL unique pointer
+	binary.Write(b, binary.LittleEndian, uint32(0))
+
+	// ClientImpLevel: 2 (impersonate)
+	binary.Write(b, binary.LittleEndian, uint32(2))
+
+	// Mode: 0
+	binary.Write(b, binary.LittleEndian, uint32(0))
+
+	// Interfaces: 1
+	binary.Write(b, binary.LittleEndian, uint32(1))
+
+	// pIIDs: non-null referent + max_count + IWbemLevel1Login IID (inline)
+	binary.Write(b, binary.LittleEndian, uint32(0x00007494)) // referent
+	binary.Write(b, binary.LittleEndian, uint32(1))          // max_count
+	b.Write(uuidWbemLogin[:])                                 // IID (16 bytes)
+
+	// cRequestedProtseqs: 1
+	binary.Write(b, binary.LittleEndian, uint16(1))
+
+	// 2-byte alignment padding
+	binary.Write(b, binary.LittleEndian, uint16(0))
+
+	// aRequestedProtseqs: max_count=1, [7 = ncacn_ip_tcp]
+	binary.Write(b, binary.LittleEndian, uint32(1))
+	binary.Write(b, binary.LittleEndian, uint16(7))
+
+	return b.Bytes()
+}
+
+// parseActivationPort extracts the TCP port from a RemoteActivation response stub.
+//
+// Wire layout of the stub (before IPID, MInterfacePointer, etc.):
+//
+//	ORPCthat (8) + OXID (8) + PDUALSTRINGARRAY referent (4)
+//	+ max_count (4) + wNumEntries (2) + wSecurityOffset (2) + aStringArray
+//
+// aStringArray contains STRINGBINDING entries: wTowerId(2) + null-terminated
+// UTF-16LE network address. Tower 7 = ncacn_ip_tcp; address = "host[port]".
+func parseActivationPort(stub []byte) (int, error) {
+	// offset 0..7:  ORPCthat (flags=4, extensions=4)
+	// offset 8..15: OXID (uint64)
+	// offset 16..19: PDUALSTRINGARRAY referent
+	// offset 20..23: max_count (conformant dim of aStringArray)
+	// offset 24..25: wNumEntries
+	// offset 26..27: wSecurityOffset
+	// offset 28+: aStringArray
+	if len(stub) < 28 {
+		return 0, fmt.Errorf("stub too short (%d bytes)", len(stub))
 	}
 
-	// Fallback: probe common DCOM dynamic range
-	for p := 49152; p <= 49165; p++ {
-		probe, err := openRPC(host, p, 2*time.Second, d)
-		if err != nil {
+	referent := binary.LittleEndian.Uint32(stub[16:20])
+	if referent == 0 {
+		return 0, fmt.Errorf("PDUALSTRINGARRAY is null")
+	}
+
+	wNumEntries := int(binary.LittleEndian.Uint16(stub[24:26]))
+	if wNumEntries == 0 {
+		return 0, fmt.Errorf("DUALSTRINGARRAY is empty")
+	}
+
+	// aStringArray: wNumEntries uint16 elements, each 2 bytes
+	arrayEnd := 28 + wNumEntries*2
+	if arrayEnd > len(stub) {
+		arrayEnd = len(stub)
+	}
+	pos := 28
+
+	for pos+2 <= arrayEnd {
+		towerId := binary.LittleEndian.Uint16(stub[pos : pos+2])
+		pos += 2
+		if towerId == 0 {
+			break // null STRINGBINDING = terminator
+		}
+		// Scan for null-terminated UTF-16LE address
+		addrStart := pos
+		for pos+1 < len(stub) {
+			if stub[pos] == 0 && stub[pos+1] == 0 {
+				break
+			}
+			pos += 2
+		}
+		addrEnd := pos
+		pos += 2 // skip null terminator
+
+		if towerId != 7 { // skip non-TCP bindings
 			continue
 		}
-		bid := probe.nextID()
-		pb := buildBind(bid, 0, uuidWbemLogin, 0, 0, nil)
-		r, err := probe.sendRecv(pb)
-		probe.Close()
-		if err == nil && pktType(r) == dceTypBindAck {
-			return p, nil
+
+		// Decode UTF-16LE → string
+		addrBytes := stub[addrStart:addrEnd]
+		addrRunes := make([]uint16, len(addrBytes)/2)
+		for i := range addrRunes {
+			addrRunes[i] = binary.LittleEndian.Uint16(addrBytes[i*2:])
+		}
+		addr := string(utf16.Decode(addrRunes))
+
+		// Extract port from "host[port]"
+		if lb := strings.LastIndex(addr, "["); lb >= 0 {
+			if rb := strings.LastIndex(addr, "]"); rb > lb {
+				portStr := addr[lb+1 : rb]
+				port, err := strconv.Atoi(portStr)
+				if err == nil && port > 1024 && port < 65535 {
+					return port, nil
+				}
+			}
 		}
 	}
 
-	return 0, fmt.Errorf("EPM could not find WMI endpoint; ensure port 135 is reachable")
+	return 0, fmt.Errorf("no ncacn_ip_tcp binding in DUALSTRINGARRAY")
 }
 
 // buildEptMapStub builds the NDR stub data for ept_map(opnum=3).
@@ -474,38 +681,50 @@ func buildEptMapStub() []byte {
 	return b.Bytes()
 }
 
-// buildProtocolTower encodes a 4-floor protocol tower for IWbemLevel1Login over TCP.
+// buildProtocolTower encodes a 5-floor protocol tower for IWbemLevel1Login over TCP/IP.
+//
+// MS-RPCE §2.1.2.3.3 defines the standard TCP/IP tower as:
+//   Floor 0: UUID (0x0d) — target interface
+//   Floor 1: UUID (0x0d) — NDR transfer syntax
+//   Floor 2: 0x0b — connection-oriented RPC (no port data, rhs_length=0)
+//   Floor 3: 0x07 — TCP transport (port, big-endian, rhs_length=2)
+//   Floor 4: 0x09 — IP address (rhs_length=4)
 func buildProtocolTower() []byte {
 	b := new(bytes.Buffer)
-	binary.Write(b, binary.LittleEndian, uint16(4)) // floor_count
+	binary.Write(b, binary.LittleEndian, uint16(5)) // floor_count
 
-	// Floor 0: IWbemLevel1Login UUID (protocol 0x0d)
+	// Floor 0: IWbemLevel1Login UUID (protocol identifier 0x0d)
 	// lhs_length = 1 (proto_id) + 16 (UUID) + 2 (major) = 19
 	binary.Write(b, binary.LittleEndian, uint16(19))
 	b.WriteByte(0x0d)
 	b.Write(uuidWbemLogin[:])
-	binary.Write(b, binary.LittleEndian, uint16(0)) // major
+	binary.Write(b, binary.LittleEndian, uint16(0)) // major version
 	binary.Write(b, binary.LittleEndian, uint16(2)) // rhs_length
-	binary.Write(b, binary.LittleEndian, uint16(0)) // minor
+	binary.Write(b, binary.LittleEndian, uint16(0)) // minor version
 
 	// Floor 1: NDR transfer syntax
 	binary.Write(b, binary.LittleEndian, uint16(19))
 	b.WriteByte(0x0d)
 	b.Write(uuidNDR[:])
-	binary.Write(b, binary.LittleEndian, uint16(2)) // major
+	binary.Write(b, binary.LittleEndian, uint16(2)) // major version
 	binary.Write(b, binary.LittleEndian, uint16(2)) // rhs_length
-	binary.Write(b, binary.LittleEndian, uint16(0)) // minor
+	binary.Write(b, binary.LittleEndian, uint16(0)) // minor version
 
-	// Floor 2: TCP (protocol 0x0b), port = 0 (querying)
-	binary.Write(b, binary.LittleEndian, uint16(1))  // lhs_length
-	b.WriteByte(0x0b)                                 // TCP
-	binary.Write(b, binary.LittleEndian, uint16(2))  // rhs_length
-	binary.Write(b, binary.BigEndian, uint16(0))     // port (big-endian)
+	// Floor 2: connection-oriented RPC (0x0b) — no port data
+	binary.Write(b, binary.LittleEndian, uint16(1)) // lhs_length
+	b.WriteByte(0x0b)
+	binary.Write(b, binary.LittleEndian, uint16(0)) // rhs_length = 0
 
-	// Floor 3: IP address (protocol 0x09)
-	binary.Write(b, binary.LittleEndian, uint16(1))  // lhs_length
-	b.WriteByte(0x09)                                 // IP
-	binary.Write(b, binary.LittleEndian, uint16(4))  // rhs_length
+	// Floor 3: TCP transport (0x07), port = 0 when querying
+	binary.Write(b, binary.LittleEndian, uint16(1)) // lhs_length
+	b.WriteByte(0x07)
+	binary.Write(b, binary.LittleEndian, uint16(2)) // rhs_length
+	binary.Write(b, binary.BigEndian, uint16(0))    // port (big-endian)
+
+	// Floor 4: IP address (0x09)
+	binary.Write(b, binary.LittleEndian, uint16(1)) // lhs_length
+	b.WriteByte(0x09)
+	binary.Write(b, binary.LittleEndian, uint16(4)) // rhs_length
 	b.Write([]byte{0, 0, 0, 0})
 
 	return b.Bytes()
@@ -513,9 +732,9 @@ func buildProtocolTower() []byte {
 
 // scanForTCPPort scans the EPM response stub for a TCP floor and extracts the port.
 func scanForTCPPort(stub []byte) int {
-	// TCP floor pattern in EPM response: lhs_len=0x01 0x00, proto=0x0b, rhs_len=0x02 0x00, port(2 BE)
+	// TCP floor pattern: lhs_len=0x01 0x00, proto=0x07, rhs_len=0x02 0x00, port(2 BE)
 	for i := 0; i+6 < len(stub); i++ {
-		if stub[i] == 0x01 && stub[i+1] == 0x00 && stub[i+2] == 0x0b &&
+		if stub[i] == 0x01 && stub[i+1] == 0x00 && stub[i+2] == 0x07 &&
 			stub[i+3] == 0x02 && stub[i+4] == 0x00 {
 			port := int(binary.BigEndian.Uint16(stub[i+5:]))
 			if port > 1024 && port < 65535 {
@@ -673,8 +892,8 @@ func extractIPID(stub []byte) ([16]byte, error) {
 // invokeViaDCOM is the native DCOM/WMI execution path.
 // Steps: EPM port lookup → DCE-RPC bind with NTLM → NTLMLogin → Win32_Process.Create
 func (x *Executor) invokeViaDCOM(cmd string, timeout time.Duration) (string, int, error) {
-	// Step 1: EPM port resolution
-	wmiPort, err := resolveWMIPort(x.host, x.proxyDialer)
+	// Step 1: IActivation.RemoteActivation → dynamic WMI port
+	wmiPort, err := resolveWMIPort(x.host, x.bundle, x.proxyDialer)
 	if err != nil {
 		return "", 1, fmt.Errorf("[step 1/4 EPM] %w", err)
 	}
@@ -686,7 +905,7 @@ func (x *Executor) invokeViaDCOM(cmd string, timeout time.Duration) (string, int
 	}
 	defer s.Close()
 
-	if err := bindNTLM(s, 0, uuidWbemLogin, 0, 0, x.bundle); err != nil {
+	if _, err := bindNTLM(s, 0, uuidWbemLogin, 0, 0, x.bundle, dceAuthConnect); err != nil {
 		return "", 1, fmt.Errorf("[step 2/4 NTLM-bind IWbemLevel1Login] %w", err)
 	}
 
@@ -705,7 +924,7 @@ func (x *Executor) invokeViaDCOM(cmd string, timeout time.Duration) (string, int
 	// ExecMethod("Win32_Process", "Create", pInParams) with ORPC headers.
 	_ = ipid
 
-	bindPkt := buildBind(s.nextID(), 1, uuidWbemServices, 0, 0, nil)
+	bindPkt := buildBind(s.nextID(), 1, uuidWbemServices, 0, 0, nil, dceAuthConnect)
 	bindResp, err := s.sendRecv(bindPkt)
 	if err != nil {
 		return "", 1, fmt.Errorf("[step 4/4 IWbemServices-bind] %w", err)
