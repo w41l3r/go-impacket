@@ -3,6 +3,7 @@ package dcerpc
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/jfjallid/go-smb/smb"
@@ -95,7 +96,10 @@ func (sc *ServiceController) IgniteAndErase(name, binPath string) error {
 
 	startErr := sc.bind.StartService(name, nil)
 	_ = sc.bind.DeleteService(name)
-	if startErr != nil {
+	// ERROR_SERVICE_REQUEST_TIMEOUT (1053) is expected: the cmd.exe binPath was
+	// launched but doesn't implement the SCM protocol, so Windows times out.
+	// The command is already running — ignore this specific error.
+	if startErr != nil && !strings.Contains(startErr.Error(), "service request timeout") {
 		return fmt.Errorf("start service: %w", startErr)
 	}
 	return nil

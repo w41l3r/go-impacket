@@ -53,19 +53,10 @@ func Dial(host string, port int, bundle *cred.Bundle) (*Endpoint, error) {
 		opts.ProxyDialer = d
 	}
 
+	// NewConnection already calls NegotiateProtocol + SessionSetup internally.
 	conn, err := smb.NewConnection(opts)
 	if err != nil {
 		return nil, fmt.Errorf("SMB connect to %s:%d: %w", host, port, err)
-	}
-
-	if err = conn.NegotiateProtocol(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("negotiate: %w", err)
-	}
-
-	if err = conn.SessionSetup(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("session setup: %w", err)
 	}
 
 	return &Endpoint{conn: conn}, nil
