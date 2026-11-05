@@ -38,8 +38,6 @@ func main() {
 	relayTimeout := flag.Duration("timeout", 30*time.Second, "relay session timeout")
 	flag.Parse()
 
-	_ = socksAddr
-	_ = socksPort
 	_ = relayTimeout
 
 	banner()
@@ -105,6 +103,12 @@ func main() {
 	log.Printf("[refract] waiting for connections (targets: %d)", len(pool.All()))
 
 	if *socksMode {
+		socksListen := fmt.Sprintf("%s:%d", *socksAddr, *socksPort)
+		go func() {
+			if err := relay.ListenSOCKS5(ctx, socksListen); err != nil {
+				log.Printf("[refract] SOCKS5: %v", err)
+			}
+		}()
 		go runShell(vault, pool, cancel)
 	}
 

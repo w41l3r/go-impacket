@@ -526,6 +526,59 @@ func scanForTCPPort(stub []byte) int {
 	return 0
 }
 
+// ─── ORPC helpers ─────────────────────────────────────────────────────────────
+
+// buildORPCTHIS returns the 32-byte ORPCTHIS header prepended to every DCOM method call.
+//
+//	COMVERSION(2+2) + flags(4) + reserved(4) + CID(16) + extensions_ptr(4) = 32 bytes
+func buildORPCTHIS() []byte {
+	b := make([]byte, 32)
+	binary.LittleEndian.PutUint16(b[0:], 5) // MajorVersion
+	binary.LittleEndian.PutUint16(b[2:], 7) // MinorVersion
+	// flags=0, reserved=0 → zero
+	// CID: random-looking but fixed for the session
+	for i := 8; i < 24; i++ {
+		b[i] = byte(i * 7) // deterministic non-zero fill
+	}
+	// extensions = NULL pointer (4 bytes, already zero)
+	return b
+}
+
+// buildExecMethodStub encodes the NDR parameters for IWbemServices::ExecMethod
+// (opnum 24) with strObjectPath="Win32_Process", strMethodName="Create",
+// pInParams containing commandLine.
+func buildExecMethodStub(commandLine string) []byte {
+	buf := new(bytes.Buffer)
+
+	// ORPCTHIS (32 bytes)
+	buf.Write(buildORPCTHIS())
+
+	// strObjectPath: conformant LPWSTR "Win32_Process"
+	encodeWStr(buf, "Win32_Process")
+
+	// strMethodName: conformant LPWSTR "Create"
+	encodeWStr(buf, "Create")
+
+	// lFlags: int32 = 0
+	binary.Write(buf, binary.LittleEndian, int32(0))
+
+	// pCtx: null unique pointer (IWbemContext*)
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+
+	// pInParams: MInterfacePointer (non-null unique pointer + data)
+	mip := BuildWin32ProcessCreateInParams(commandLine)
+	binary.Write(buf, binary.LittleEndian, uint32(0x00020000)) // referent (non-null)
+	buf.Write(mip)
+
+	// ppOutParams: null
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+
+	// ppCallResult: null
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+
+	return buf.Bytes()
+}
+
 // wmiNTLMLogin calls IWbemLevel1Login::NTLMLogin (opnum 6) and returns the stub response.
 func wmiNTLMLogin(s *rpcSession, ctxID uint16) ([]byte, error) {
 	stub := buildNTLMLoginStub("//./root/cimv2")
@@ -648,12 +701,36 @@ func (x *Executor) invokeViaDCOM(cmd string, timeout time.Duration) (string, int
 		return "", 1, fmt.Errorf("[step 3/4 OBJREF-parse] %w", err)
 	}
 
-	// Step 4: Win32_Process.Create via IWbemServices
-	// Requires a new DCE-RPC session bound to IWbemServices using the IPID,
-	// then ExecMethod("Win32_Process", "Create", ...) with full COM NDR marshaling.
-	// This requires implementing IOrpcThis/IOrpcThat ORPC headers and VARIANT marshaling.
+	// Step 4: Bind IWbemServices (ctxID=1) on the same connection, then call
+	// ExecMethod("Win32_Process", "Create", pInParams) with ORPC headers.
 	_ = ipid
-	return "", 1, fmt.Errorf(
-		"[step 4/4 Win32_Process.Create] IWbemServices ExecMethod not implemented: "+
-			"IPID=%x — requires ORPC header + VARIANT NDR marshaling", ipid[:8])
+
+	bindPkt := buildBind(s.nextID(), 1, uuidWbemServices, 0, 0, nil)
+	bindResp, err := s.sendRecv(bindPkt)
+	if err != nil {
+		return "", 1, fmt.Errorf("[step 4/4 IWbemServices-bind] %w", err)
+	}
+	if pktType(bindResp) != dceTypBindAck {
+		return "", 1, fmt.Errorf("[step 4/4 IWbemServices-bind] unexpected response type 0x%02x", pktType(bindResp))
+	}
+
+	execStub := buildExecMethodStub(cmd)
+	reqPkt := buildRequest(s.nextID(), 1, 24, execStub) // opnum 24 = ExecMethod
+	execResp, err := s.sendRecv(reqPkt)
+	if err != nil {
+		return "", 1, fmt.Errorf("[step 4/4 ExecMethod] %w", err)
+	}
+	if pktType(execResp) != dceTypResponse {
+		return "", 1, fmt.Errorf("[step 4/4 ExecMethod] unexpected packet type 0x%02x", pktType(execResp))
+	}
+
+	// Check HRESULT in last 4 bytes of stub
+	if len(execResp) < 28 {
+		return "", 1, fmt.Errorf("[step 4/4 ExecMethod] response too short")
+	}
+	hresult := binary.LittleEndian.Uint32(execResp[len(execResp)-4:])
+	if hresult != 0 {
+		return "", 1, fmt.Errorf("[step 4/4 ExecMethod] HRESULT=0x%08X", hresult)
+	}
+	return "", 0, nil
 }
